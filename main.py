@@ -1,523 +1,337 @@
 # -*- coding: utf-8 -*-
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 import pandas as pd
-import openpyxl
 import pyodbc
 import traceback
-from pathlib import Path
-import datetime
-from collections import defaultdict
-from openpyxl.styles import Font, PatternFill, Alignment
+import time  # 用于计时
+import numpy as np  # 引入numpy用于插入空值 NaN
+import os # 引入os模块用于路径操作
+import tkinter as tk # 引入tkinter用于GUI
+from tkinter import filedialog # 引入filedialog用于文件对话框
 
-# ============== 用户配置区 ==============
-DB_CONN_STRING = (
-    "DRIVER={ODBC Driver 17 for SQL Server};"
-    "SERVER=192.168.0.117;"
-    "DATABASE=FQD;"
-    "UID=zhitan;"
-    "PWD=Zt@forcome;"
+# --- !!! 请根据你的环境修改下面的 pyodbc 连接字符串 !!! ---
+PYODBC_CONN_STRING = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=192.168.0.117;DATABASE=FQD;UID=zhitan;PWD=Zt@forcome;"  # <-- 确保这里是你的连接信息
+
+# --- SQL 查询语句 (已包含MF003作为第一列, 并重命名为'工序序号') ---
+sql_query = """
+WITH TopLevelItems AS (
+    SELECT DISTINCT BOM.CB001 AS ProductID
+    FROM BOMCB AS BOM LEFT JOIN BOMCB AS IsComponentCheck ON BOM.CB001 = IsComponentCheck.CB005
+    WHERE IsComponentCheck.CB005 IS NULL AND EXISTS (SELECT 1 FROM BOMCB WHERE CB001 = BOM.CB001 AND CB005 IS NOT NULL)
+), BomHierarchy AS (
+    SELECT BOM.CB001 AS TopLevelProductID, BOM.CB001 AS ParentID, BOM.CB005 AS ComponentID, 1 AS BomLevel, BOM.CB008 AS ComponentUsageQty,
+           CAST(RIGHT(REPLICATE('0', 50) + CAST(BOM.CB001 AS VARCHAR(50)), 50) + '/L1/' + RIGHT(REPLICATE('0', 50) + CAST(BOM.CB005 AS VARCHAR(50)), 50) AS VARCHAR(MAX)) AS SortPath
+    FROM BOMCB AS BOM WHERE BOM.CB001 IN (SELECT ProductID FROM TopLevelItems) AND BOM.CB005 IS NOT NULL
+    UNION ALL
+    SELECT BH.TopLevelProductID, BOM_Rec.CB001 AS ParentID, BOM_Rec.CB005 AS ComponentID, BH.BomLevel + 1 AS BomLevel, BOM_Rec.CB008 AS ComponentUsageQty,
+           CAST(BH.SortPath + '/L' + CAST(BH.BomLevel + 1 AS VARCHAR(2)) + '/' + RIGHT(REPLICATE('0', 50) + CAST(BOM_Rec.CB005 AS VARCHAR(50)), 50) AS VARCHAR(MAX)) AS SortPath
+    FROM BOMCB AS BOM_Rec INNER JOIN BomHierarchy AS BH ON BOM_Rec.CB001 = BH.ComponentID
+), CombinedResults AS (
+    SELECT TLI.ProductID AS TopLevelProductID, TopLevelInfo.MB002 AS TopLevelProductName, TLI.ProductID AS ParentID, TopLevelInfo.MB002 AS ParentName,
+           TopLevelInfo.MB025 AS Parent_MB025_Status, -- MB025 for TopLevel/Parent
+           NULL AS ComponentID, NULL AS ComponentName, NULL AS Component_MB025_Status, -- No specific component here
+           TopLevelInfo.MB003 AS ComponentSpec, NULL AS ComponentUsageQty, 0 AS BomLevel,
+           Routing.MF003 AS ProcessingSequence, Routing.MF004 AS OperationCode, OpMaster.MW002 AS OperationName, Routing.MF007 AS WorkshopName,
+           Routing.MF009 AS StandardManHours, Routing.MF024 AS StandardMachineHours, Routing.UDF02 AS EquipmentCode_UDF, Routing.UDF03 AS EquipmentName_UDF,
+           CAST(RIGHT(REPLICATE('0', 50) + CAST(TLI.ProductID AS VARCHAR(50)), 50) + '/L0' AS VARCHAR(MAX)) AS SortPathForOrdering
+    FROM TopLevelItems AS TLI INNER JOIN INVMB AS TopLevelInfo ON TLI.ProductID = TopLevelInfo.MB001
+    LEFT JOIN BOMMF AS Routing ON TLI.ProductID = Routing.MF001 LEFT JOIN CMSMW AS OpMaster ON Routing.MF004 = OpMaster.MW001
+    UNION ALL
+    SELECT BH.TopLevelProductID, TopLevelInfo.MB002 AS TopLevelProductName, BH.ParentID, ParentInfo.MB002 AS ParentName,
+           ParentInfo.MB025 AS Parent_MB025_Status, -- MB025 for Parent
+           BH.ComponentID, CompInfo.MB002 AS ComponentName, CompInfo.MB025 AS Component_MB025_Status, -- MB025 for Component
+           CompInfo.MB003 AS ComponentSpec,
+           BH.ComponentUsageQty, BH.BomLevel, Routing.MF003 AS ProcessingSequence, Routing.MF004 AS OperationCode, OpMaster.MW002 AS OperationName, Routing.MF007 AS WorkshopName,
+           Routing.MF009 AS StandardManHours, Routing.MF024 AS StandardMachineHours, Routing.UDF02 AS EquipmentCode_UDF, Routing.UDF03 AS EquipmentName_UDF, BH.SortPath AS SortPathForOrdering
+    FROM BomHierarchy AS BH LEFT JOIN INVMB AS TopLevelInfo ON BH.TopLevelProductID = TopLevelInfo.MB001 LEFT JOIN INVMB AS ParentInfo ON BH.ParentID = ParentInfo.MB001
+    LEFT JOIN INVMB AS CompInfo ON BH.ComponentID = CompInfo.MB001 LEFT JOIN BOMMF AS Routing ON BH.ComponentID = Routing.MF001 LEFT JOIN CMSMW AS OpMaster ON Routing.MF004 = OpMaster.MW001
 )
+-- 4. 最终输出并排序
+-- *** 修改点 1: 在 SELECT 列表的最前面增加了 ProcessingSequence AS '工序序号' ***
+SELECT ProcessingSequence AS '工序序号', -- <-- 【新增列】根据您的要求，将MF003(ProcessingSequence)作为第一列并命名
+       TopLevelProductID AS '顶层成品品号', TopLevelProductName AS '顶层成品品名', ParentID AS '父项品号', ParentName AS '父项品名',
+       Parent_MB025_Status AS '父项MB025',
+       ComponentID AS '元件品号', ComponentName AS '元件品名',
+       Component_MB025_Status AS '元件MB025',
+       ComponentSpec AS '元件规格', ComponentUsageQty AS '组成用量', BomLevel AS 'BOM阶次',
+       ProcessingSequence AS '加工顺序', OperationCode AS '工艺代码', OperationName AS '工艺名称', WorkshopName AS '车间名称',
+       StandardManHours AS '标准人时', StandardMachineHours AS '标准机时', EquipmentCode_UDF AS '设备编号_UDF', EquipmentName_UDF AS '设备名称_UDF'
+FROM CombinedResults
+ORDER BY
+    TopLevelProductID,
+    SortPathForOrdering,
+    ProcessingSequence DESC;
+"""
 
-# 截图中的关键配置
-ROW_IDX_HEADER_MAIN = 2    # 主表头所在行 (如：工单单号、车间)
-ROW_IDX_HEADER_DATE = 3    # 日期表头所在行 (如：1/25, 1/26)
-ROW_IDX_DATA_START = 4     # 数据起始行
+# --- 执行查询并将结果保存到 Excel ---
+conn = None
+try:
+    start_time = time.time()
+    print("正在连接数据库...")
+    # --- 数据库连接 (安全, 仅读取) ---
+    conn = pyodbc.connect(PYODBC_CONN_STRING)
+    print("数据库连接成功。")
 
-COL_NAME_WORKSHOP = "车间"      # 截图K列
-COL_NAME_WO_TYPE = "单别"       # 截图E列
-COL_NAME_WO_NO = "工单单号"     # 截图D列
-COL_NAME_WO_TOTAL = "工单预计生产总量" # 需确认ERP字段或Excel是否有此列，如果没有，代码将从ERP查询
+    print("正在执行【读取】数据库信息的操作...")
+    # --- 执行 SQL 查询 (安全, 仅读取) ---
+    df_all_details = pd.read_sql(sql_query, conn)
+    query_end_time = time.time()
+    print(f"数据库信息【读取】完成。查询耗时: {query_end_time - start_time:.2f} 秒。")
 
-# ============== 应用程序类 ==============
+    if not df_all_details.empty:
+        # --- 数据筛选逻辑 (初步筛选，在内存中操作) ---
+        print("开始在【内存中】进行初步数据筛选...")
+        df_filtered = df_all_details.copy()
+        filter_end_time = time.time()
+        print(f"【内存中】初步筛选完成。耗时: {filter_end_time - query_end_time:.2f} 秒。")
+        # --- 初步筛选逻辑结束 ---
 
-class DailyPlanAvailabilityApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("每日排程齐套分析工具 v4.0 (横向日期版)")
-        self.root.geometry("900x650")
+        if not df_filtered.empty:
+            # --- Part 1: 调整DataFrame结构和表头 (在内存中操作) ---
+            print("\n开始在【内存中】调整结构和表头 (Part 1)...")
+            adjustment_start_time_p1 = time.time()
+            rename_dict_p1 = {
+                '顶层成品品号': '产品编号', '顶层成品品名': '产品名称',
+                '父项品号': '料号', '父项品名': '品名'
+            }
+            df_filtered.rename(columns=rename_dict_p1, inplace=True)
+            df_filtered.insert(2, '工单单号', np.nan)
+            df_filtered.insert(3, '工单单别', np.nan)
+            adjustment_end_time_p1 = time.time()
+            print(f"【内存中】结构和表头调整完成 (Part 1)。耗时: {adjustment_end_time_p1 - adjustment_start_time_p1:.2f} 秒。")
+            # --- Part 1 调整结束 ---
 
-        # 样式定义
-        self.red_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
-        self.green_fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
-        
-        # 变量绑定
-        self.file_path = tk.StringVar()
-        self.sheet_name = tk.StringVar()
-        self.selected_date_str = tk.StringVar()
-        self.selected_workshop = tk.StringVar()
+            # --- Part 2: 根据BOM阶次调整 '料号' 和 '品名' (在内存中操作) ---
+            print("\n开始在【内存中】调整 '料号' 和 '品名' (Part 2)...")
+            adjustment_start_time_p2 = time.time()
+            non_zero_bom_mask = df_filtered['BOM阶次'] != 0
+            df_filtered.loc[non_zero_bom_mask, '料号'] = df_filtered.loc[non_zero_bom_mask, '元件品号']
+            df_filtered.loc[non_zero_bom_mask, '品名'] = df_filtered.loc[non_zero_bom_mask, '元件品名']
+            adjustment_end_time_p2 = time.time()
+            print(f"【内存中】'料号' 和 '品名' 调整完成 (Part 2)。耗时: {adjustment_end_time_p2 - adjustment_start_time_p2:.2f} 秒。")
+            # --- Part 2 调整结束 ---
 
-        # 缓存数据
-        self.date_column_map = {}  # {'2026-01-25': 105, ...} 存储日期对应的列号
-        self.all_workshops = []
-        self.col_map_main = {}     # 主表头列索引
+            # --- Part 3: 数据准备、计算和最终列选择/重命名 (在内存中操作) ---
+            print("\n开始在【内存中】进行数据准备和最终列格式化 (Part 3)...")
+            adjustment_start_time_p3 = time.time()
 
-        self._create_widgets()
-
-    def _create_widgets(self):
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # 1. 文件选择
-        file_frame = ttk.LabelFrame(main_frame, text="1. 数据源", padding="5")
-        file_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Entry(file_frame, textvariable=self.file_path, width=50).pack(side=tk.LEFT, padx=5)
-        ttk.Button(file_frame, text="浏览Excel...", command=self._select_file).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(file_frame, text="   工作表:").pack(side=tk.LEFT)
-        self.sheet_combo = ttk.Combobox(file_frame, textvariable=self.sheet_name, state="disabled", width=15)
-        self.sheet_combo.pack(side=tk.LEFT, padx=5)
-        self.sheet_combo.bind("<<ComboboxSelected>>", self._on_sheet_selected)
-
-        # 2. 筛选设置
-        filter_frame = ttk.LabelFrame(main_frame, text="2. 计划筛选 (自动扫描第3行日期)", padding="10")
-        filter_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Label(filter_frame, text="选择日期:").grid(row=0, column=0, sticky="w")
-        self.date_combo = ttk.Combobox(filter_frame, textvariable=self.selected_date_str, state="disabled", width=25)
-        self.date_combo.grid(row=0, column=1, padx=5, sticky="w")
-
-        ttk.Label(filter_frame, text="选择车间:").grid(row=0, column=2, sticky="w", padx=(20, 0))
-        self.workshop_combo = ttk.Combobox(filter_frame, textvariable=self.selected_workshop, state="disabled", width=20)
-        self.workshop_combo.grid(row=0, column=3, padx=5, sticky="w")
-
-        # 3. 操作区
-        action_frame = ttk.LabelFrame(main_frame, text="3. 执行", padding="10")
-        action_frame.pack(fill=tk.X, pady=10)
-        
-        btn = ttk.Button(action_frame, text="计算齐套率 -> 写入A列 -> 标红缺料", command=self._run_analysis)
-        btn.pack(fill=tk.X, padx=100)
-
-        # 4. 日志
-        self.log_text = tk.Text(main_frame, height=12, state="disabled", font=("Consolas", 9), bg="#F0F0F0")
-        self.log_text.pack(fill=tk.BOTH, expand=True, pady=5)
-
-    def _log(self, msg):
-        self.log_text.config(state="normal")
-        self.log_text.insert(tk.END, f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state="disabled")
-        self.root.update_idletasks()
-
-    def _select_file(self):
-        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
-        if path:
-            self.file_path.set(path)
-            try:
-                wb = openpyxl.load_workbook(path, read_only=True)
-                self.sheet_combo['values'] = wb.sheetnames
-                if wb.sheetnames: 
-                    self.sheet_combo.current(0)
-                    self._on_sheet_selected(None)
-                self.sheet_combo.config(state="readonly")
-            except Exception as e:
-                messagebox.showerror("错误", f"无法打开文件: {e}")
-
-    def _on_sheet_selected(self, event):
-        """当Sheet改变时，扫描表头结构"""
-        file_path = self.file_path.get()
-        sheet_name = self.sheet_name.get()
-        if not file_path or not sheet_name: return
-
-        self._log("正在扫描Excel结构 (表头和日期列)...")
-        try:
-            wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
-            ws = wb[sheet_name]
-
-            # 1. 扫描主表头 (第2行)
-            self.col_map_main = {}
-            for cell in ws[ROW_IDX_HEADER_MAIN]:
-                if cell.value:
-                    self.col_map_main[str(cell.value).strip()] = cell.column
-
-            # 检查关键列是否存在
-            required_cols = [COL_NAME_WORKSHOP, COL_NAME_WO_TYPE, COL_NAME_WO_NO]
-            missing = [c for c in required_cols if c not in self.col_map_main]
-            if missing:
-                messagebox.showwarning("警告", f"未找到关键列: {missing}\n请检查Excel表头(第2行)名称是否与配置一致。")
-                return
-
-            # 2. 扫描日期列 (第3行)
-            self.date_column_map = {}
-            # 假设日期列在主数据列之后，或者遍历整行。
-            # 通常排程表的日期在后面，我们遍历所有有值的单元格
-            for cell in ws[ROW_IDX_HEADER_DATE]:
-                val = cell.value
-                date_str = self._parse_excel_date(val)
-                if date_str:
-                    self.date_column_map[date_str] = cell.column
-
-            dates = sorted(list(self.date_column_map.keys()))
-            if not dates:
-                self._log("警告: 在第3行未找到任何日期格式的表头！")
+            df_filtered.rename(columns={'元件规格': '物料描述'}, inplace=True)
+            print(" - 列 '元件规格' 重命名为 '物料描述'")
+            df_filtered['标准工时'] = df_filtered['标准人时'].fillna(0) + df_filtered['标准机时'].fillna(0)
+            print(" - 计算 '标准工时'")
+            if '工艺名称' in df_filtered.columns and '设备名称_UDF' in df_filtered.columns:
+                df_filtered['设备名称_UDF'] = df_filtered['工艺名称']
+                print(" - 数据替换: 已将原始 '工艺名称' 数据复制到 '设备名称_UDF' 列")
             else:
-                self._log(f"找到 {len(dates)} 个排程日期: {dates[0]} 至 {dates[-1]}")
-                self.date_combo['values'] = dates
-                self.date_combo.current(0)
-                self.date_combo.config(state="readonly")
+                print(" - 警告: '工艺名称' 或 '设备名称_UDF' 列不存在于 df_filtered，无法执行数据替换。")
 
-            # 3. 扫描车间 (读取数据行去重)
-            col_ws_idx = self.col_map_main[COL_NAME_WORKSHOP]
-            workshops = set()
-            # 简单扫描前1000行或全部
-            for row in ws.iter_rows(min_row=ROW_IDX_DATA_START, min_col=col_ws_idx, max_col=col_ws_idx, values_only=True):
-                if row[0]: workshops.add(str(row[0]).strip())
-            
-            ws_list = sorted(list(workshops))
-            self.workshop_combo['values'] = ["全部车间"] + ws_list
-            self.workshop_combo.current(0)
-            self.workshop_combo.config(state="readonly")
+            # *** 修改点 2: 将 '工序序号' 添加到列清单的最前面 ***
+            intermediate_columns_source_names = [
+                '工序序号',       # <-- 【新增列】确保 '工序序号' 作为第一列被选中
+                '产品编号', '产品名称', '工单单号', '工单单别',
+                '料号', '品名', '物料描述', 'BOM阶次',
+                '设备编号_UDF', '设备名称_UDF', '车间名称', '标准工时',
+                '组成用量',
+                '父项MB025', '元件MB025'
+            ]
 
-        except Exception as e:
-            traceback.print_exc()
-            self._log(f"扫描失败: {e}")
-
-    def _parse_excel_date(self, val):
-        """解析单元格中的日期 (支持 Excel日期数字, datetime对象, 字符串)"""
-        if val is None: return None
-        try:
-            dt = None
-            if isinstance(val, (datetime.datetime, datetime.date)):
-                dt = val
-            elif isinstance(val, (int, float)):
-                # Excel serial date
-                dt = datetime.datetime(1899, 12, 30) + datetime.timedelta(days=int(val))
-            elif isinstance(val, str):
-                # 尝试解析字符串 "1/25", "2026/1/25"
-                # 根据截图，可能是不带年份的 "M/D"
-                parts = val.strip().split('/')
-                if len(parts) == 2: # M/D
-                    # 这是一个模糊日期，默认用当前年份或下一年？
-                    # 截图里有2025和2026，为了保险，最好Excel里是真日期格式。
-                    # 这里暂且假设是真日期格式被读取。如果是纯文本，需要额外逻辑。
-                    # 临时逻辑：如果解析出纯文本，返回原文本
-                    return val.strip() 
-                elif len(parts) == 3:
-                     dt = datetime.datetime.strptime(val.strip(), "%Y/%m/%d")
-            
-            if dt:
-                return dt.strftime("%Y-%m-%d")
-            return None
-        except:
-            return None
-
-    def _run_analysis(self):
-        target_date = self.selected_date_str.get()
-        target_workshop = self.selected_workshop.get()
-        file_path = self.file_path.get()
-        sheet_name = self.sheet_name.get()
-
-        if not target_date or not self.date_column_map:
-            messagebox.showwarning("提示", "请先选择一个有效的日期。")
-            return
-
-        target_col_idx = self.date_column_map.get(target_date)
-        if not target_col_idx:
-            self._log(f"错误: 无法找到日期 {target_date} 对应的列号。")
-            return
-
-        if not messagebox.askyesno("确认", 
-            f"目标日期: 【{target_date}】\n"
-            f"目标车间: 【{target_workshop}】\n\n"
-            f"程序将读取Excel中对应日期的列(排产数)，\n"
-            "并重新计算齐套率写入【A列】。\n"
-            "这会覆盖A列原有内容，是否继续？"):
-            return
-
-        try:
-            self._log("="*50)
-            self._log(f"开始分析... 目标列号: {target_col_idx}")
-            
-            # 1. 读取符合条件的计划行
-            plans = self._load_daily_plans(file_path, sheet_name, target_col_idx, target_workshop)
-            
-            if not plans:
-                self._log("该日期/车间下没有非零的排产计划。")
-                messagebox.showinfo("无数据", "该日期下没有找到排产数量 > 0 的计划。")
-                return
-            
-            self._log(f"找到 {len(plans)} 条有效计划。")
-
-            # 2. 获取数据库数据
-            wo_keys = list(set(p['wo_key'] for p in plans))
-            self._log("查询ERP工单BOM...")
-            wo_details = self._fetch_erp_data(wo_keys)
-            
-            all_parts = set()
-            for w in wo_details.values():
-                for b in w['bom']: all_parts.add(b['part'])
-            
-            self._log(f"查询ERP实时库存 ({len(all_parts)} 种物料)...")
-            inventory = self._fetch_inventory(list(all_parts))
-
-            # 3. 模拟计算
-            self._log("执行齐套模拟 (All-or-Nothing)...")
-            results, stats = self._simulate(plans, wo_details, inventory)
-
-            # 4. 写入Excel
-            self._log("写入结果到Excel...")
-            self._write_excel(file_path, sheet_name, results)
-
-            # 5. 结果弹窗
-            self._show_summary(target_date, stats)
-
-        except Exception as e:
-            traceback.print_exc()
-            self._log(f"严重错误: {e}")
-            messagebox.showerror("错误", str(e))
-
-    def _load_daily_plans(self, file_path, sheet_name, date_col_idx, filter_ws):
-        """读取指定列有数值的行"""
-        wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
-        ws = wb[sheet_name]
-
-        # 获取列索引
-        c_ws = self.col_map_main[COL_NAME_WORKSHOP]
-        c_type = self.col_map_main[COL_NAME_WO_TYPE]
-        c_no = self.col_map_main[COL_NAME_WO_NO]
-        
-        plans = []
-        
-        # 遍历数据行
-        # 优化：只读取必要的列。但 openpyxl read_only 只能按行读取。
-        for row in ws.iter_rows(min_row=ROW_IDX_DATA_START):
-            # 获取该行日期列的值 (注意 iter_rows 返回的是元组，索引从0开始)
-            # date_col_idx 是 1-based，所以要 -1
-            try:
-                # 检查索引是否越界
-                if date_col_idx > len(row): continue
-                
-                daily_qty_val = row[date_col_idx - 1].value
-                
-                # 检查是否有排产 (非空 且 > 0)
-                # 处理 Excel 可能的括号负数或文本格式，截图里 "(30)" 可能是负数或者是备注
-                # 截图显示正数如 "65", "9", "30"。
-                if isinstance(daily_qty_val, (int, float)) and daily_qty_val > 0:
-                    
-                    # 检查车间
-                    curr_ws = row[c_ws - 1].value
-                    curr_ws = str(curr_ws).strip() if curr_ws else "未分类"
-                    
-                    if filter_ws != "全部车间" and curr_ws != filter_ws:
-                        continue
-                        
-                    # 提取工单信息
-                    wo_type = row[c_type - 1].value
-                    wo_no = row[c_no - 1].value
-                    
-                    if wo_type and wo_no:
-                        plans.append({
-                            'row_idx': row[0].row, # 获取真实行号
-                            'wo_key': (str(wo_type).strip(), str(wo_no).strip()),
-                            'daily_qty': float(daily_qty_val),
-                            'workshop': curr_ws
-                        })
-            except IndexError:
-                continue
-                
-        return plans
-
-    def _fetch_erp_data(self, wo_keys):
-        """查询ERP BOM和工单总量"""
-        if not wo_keys: return {}
-        
-        # 构造批量查询
-        # 注意：如果工单太多，可能需要分批。这里简化处理。
-        conditions = []
-        for t, n in wo_keys:
-            conditions.append(f"(TA.TA001='{t}' AND TA.TA002='{n}')")
-        
-        if not conditions: return {}
-        
-        where_sql = " OR ".join(conditions)
-        
-        sql = f"""
-            SELECT 
-                RTRIM(TA.TA001) as ta001, RTRIM(TA.TA002) as ta002, 
-                TA.TA015 as wo_total_qty,
-                RTRIM(TB.TB003) as part_no, ISNULL(RTRIM(MB.MB002),'') as part_name,
-                TB.TB004 as req_qty, TB.TB005 as iss_qty
-            FROM MOCTA TA
-            INNER JOIN MOCTB TB ON TA.TA001 = TB.TB001 AND TA.TA002 = TB.TB002
-            LEFT JOIN INVMB MB ON TB.TB003 = MB.MB001
-            WHERE {where_sql}
-        """
-        
-        try:
-            with pyodbc.connect(DB_CONN_STRING) as conn:
-                df = pd.read_sql(sql, conn)
-        except Exception as e:
-            raise Exception(f"数据库查询失败: {e}")
-
-        data = defaultdict(lambda: {'total': 0, 'bom': []})
-        for _, row in df.iterrows():
-            k = (row['ta001'], row['ta002'])
-            data[k]['total'] = float(row['wo_total_qty'])
-            data[k]['bom'].append({
-                'part': row['part_no'],
-                'name': row['part_name'],
-                'req': float(row['req_qty']),
-                'iss': float(row['iss_qty'])
-            })
-        return data
-
-    def _fetch_inventory(self, parts):
-        if not parts: return {}
-        # 简单处理，如果parts太多可能报错，实际生产建议分批
-        p_str = ",".join(f"'{p}'" for p in parts)
-        sql = f"SELECT RTRIM(MC001) as p, SUM(MC007) as q FROM INVMC WHERE MC001 IN ({p_str}) GROUP BY MC001"
-        try:
-            with pyodbc.connect(DB_CONN_STRING) as conn:
-                df = pd.read_sql(sql, conn)
-            return pd.Series(df.q.values, index=df.p).to_dict()
-        except:
-            return {}
-
-    def _simulate(self, plans, wo_data, inventory):
-        """
-        plans: list of dict {'row_idx', 'wo_key', 'daily_qty', 'workshop'}
-        """
-        running_inv = inventory.copy()
-        results = {} # {row_idx: {'text': str, 'short': bool}}
-        
-        stats = {
-            'total_plans': 0,
-            'kitted_plans': 0,
-            'ws_stats': defaultdict(lambda: {'total': 0, 'kitted': 0})
-        }
-        
-        for p in plans:
-            row = p['row_idx']
-            wo_key = p['wo_key']
-            daily_qty = p['daily_qty'] # 本日计划数
-            ws = p['workshop']
-            
-            stats['total_plans'] += 1
-            stats['ws_stats'][ws]['total'] += 1
-            
-            info = wo_data.get(wo_key)
-            if not info or not info['bom']:
-                results[row] = {'text': "无ERP信息", 'short': True}
-                continue
-                
-            wo_total_qty = info['total'] # 工单总排产量
-            
-            # --- 核心逻辑 ---
-            # 净需求 = Min(工单剩余未发, 本次计划对应的理论配比需求)
-            
-            items_needed = 0
-            items_kitted = 0
-            shortage_details = [] # ["品名(缺xx)"]
-            
-            # 记录本单如果要扣减库存，需要扣多少
-            to_deduct = {} # {part: qty}
-            
-            is_fully_kitted = True
-            
-            # 最小可产套数计算 (受限于短板物料)
-            min_possible_sets = 9999999
-            
-            for bom in info['bom']:
-                part = bom['part']
-                remain_issue = max(0, bom['req'] - bom['iss']) # 剩余未领
-                
-                # 理论配比需求 = (单耗) * 本次计划数
-                unit_usage = bom['req'] / wo_total_qty if wo_total_qty > 0 else 0
-                theo_demand = daily_qty * unit_usage
-                
-                # 实际净需求
-                net_demand = min(remain_issue, theo_demand)
-                
-                if net_demand <= 0: continue # 不需要领料
-                
-                items_needed += 1
-                to_deduct[part] = net_demand
-                
-                current_stock = running_inv.get(part, 0)
-                
-                # 计算该物料支持生产多少个成品
-                can_make = int(current_stock // unit_usage) if unit_usage > 0 else 999999
-                min_possible_sets = min(min_possible_sets, can_make)
-                
-                if current_stock >= net_demand:
-                    items_kitted += 1
+            actual_intermediate_cols = []
+            for col_name in intermediate_columns_source_names:
+                if col_name in df_filtered.columns:
+                    actual_intermediate_cols.append(col_name)
                 else:
-                    is_fully_kitted = False
-                    short_qty = net_demand - current_stock
-                    shortage_details.append(f"{bom['name']}(缺{short_qty:.1f})")
+                    if col_name not in ['父项MB025', '元件MB025', '工序序号']:
+                        print(f"严重警告：核心数据列 '{col_name}' 在df_filtered中不存在，后续处理可能失败或结果不准确。")
+                    else:
+                        print(f"警告：辅助列 '{col_name}' 在df_filtered中不存在，相关逻辑可能无法正常工作。")
 
-            # 修正最小可产套数 (不能超过计划数)
-            actual_possible_sets = min(int(daily_qty), min_possible_sets)
-            if items_needed == 0: 
-                actual_possible_sets = int(daily_qty)
-                is_fully_kitted = True
+            try:
+                df_intermediate = df_filtered[actual_intermediate_cols].copy()
+                print(f" - 已选择中间过程列，准备进行最终筛选: {actual_intermediate_cols}")
+            except KeyError as e:
+                print(f"错误：尝试选择列创建df_intermediate时出错，列 '{e}' 不存在于 df_filtered 中。")
+                print("df_filtered 当前可用列名:", df_filtered.columns.tolist())
+                raise
 
-            # 计算齐套率
-            rate = (items_kitted / items_needed) if items_needed > 0 else 1.0
-            
-            # 构造A列文本
-            txt = f"齐套率:{rate:.0%} | 可产:{actual_possible_sets}"
-            if not is_fully_kitted:
-                txt += " | 缺:" + ",".join(shortage_details[:2]) # 只显示前2个缺料避免太长
-                if len(shortage_details) > 2: txt += "..."
-            
-            results[row] = {'text': txt, 'short': not is_fully_kitted}
-            
-            # 库存扣减 (All-or-Nothing)
-            if is_fully_kitted:
-                stats['kitted_plans'] += 1
-                stats['ws_stats'][ws]['kitted'] += 1
-                for part, qty in to_deduct.items():
-                    running_inv[part] -= qty
-            
-        return results, stats
+            final_rename_map = {
+                '设备编号_UDF': '设备编号', '设备名称_UDF': '工艺名称', '车间名称': '车间',
+            }
+            df_intermediate.rename(columns=final_rename_map, inplace=True)
+            print(f" - 已将df_intermediate中的列重命名，当前列: {list(df_intermediate.columns)}")
+            adjustment_end_time_p3 = time.time()
+            print(f"【内存中】数据准备和最终列格式化完成 (Part 3)。耗时: {adjustment_end_time_p3 - adjustment_start_time_p3:.2f} 秒。")
+            # --- Part 3 调整结束 ---
 
-    def _write_excel(self, file_path, sheet_name, results):
-        wb = openpyxl.load_workbook(file_path)
-        ws = wb[sheet_name]
-        
-        font = Font(name="微软雅黑", size=9)
-        align = Alignment(wrap_text=True, vertical="center")
-        
-        # 为了不影响未筛选的行，我们只更新 results 中存在的行
-        # 如果需要清空A列其他行，需要遍历整个A列。
-        # 建议：仅覆盖计算的行，这样保留历史记录？或者根据需求清空。
-        # 这里逻辑：只更新计算行。
-        
-        for row_idx, res in results.items():
-            cell = ws.cell(row=row_idx, column=1) # A列
-            cell.value = res['text']
-            cell.font = font
-            cell.alignment = align
-            
-            if res['short']:
-                cell.fill = self.red_fill
+            # --- Part 4: 最终行筛选 (根据BOM阶次=0 或 元件为自制品'M') ---
+            print("\n开始在【内存中】进行最终行筛选 (Part 4)...")
+            filtering_start_time_p4 = time.time()
+            condition_level_0 = df_intermediate['BOM阶次'] == 0
+            if '元件MB025' in df_intermediate.columns:
+                condition_component_is_self_made = (df_intermediate['BOM阶次'] != 0) & (df_intermediate['元件MB025'] == 'M')
+                print(" - 筛选条件: (BOM阶次为0) 或 (BOM阶次不为0 且 元件MB025为'M')")
             else:
-                cell.fill = self.green_fill # 全齐套标绿，方便区分
+                condition_component_is_self_made = pd.Series([False] * len(df_intermediate), index=df_intermediate.index)
+                print(" - 警告: '元件MB025' 列不在df_intermediate中，筛选将仅保留BOM阶次为0的行。")
+            final_filter_mask = condition_level_0 | condition_component_is_self_made
+            df_final = df_intermediate[final_filter_mask].copy()
+            rows_before = len(df_intermediate)
+            rows_after = len(df_final)
+            filtering_end_time_p4 = time.time()
+            print(f" - 从 {rows_before} 行筛选至 {rows_after} 行")
+            print(f"【内存中】最终行筛选完成 (Part 4)。耗时: {filtering_end_time_p4 - filtering_start_time_p4:.2f} 秒。")
+            # --- Part 4 调整结束 ---
+            # --- Part 5: 聚合数据以生成物料汇总视图 (按[产品编号, 料号]分组) ---
+            print("\n开始在【内存中】聚合数据，生成物料汇总视图 (Part 5)...")
+            print(" - (方法: 按[产品编号, 料号]分组，保留BOM上下文)")
+            agg_start_time_p5 = time.time()
 
-        wb.save(file_path)
+            # *********** 修改点 1 ***********
+            # 检查 df_final (Part 4 的结果) 是否为空
+            if df_final.empty:
+                print(" - df_final 为空 (无自制件或成品)，无法进行聚合。")
+                df_summary = pd.DataFrame()  # 创建一个空的DataFrame
+            else:
 
-    def _show_summary(self, date_str, stats):
-        msg = f"日期: {date_str}\n"
-        msg += f"总计划行数: {stats['total_plans']}\n"
-        msg += f"全齐套行数: {stats['kitted_plans']}\n"
-        total_rate = stats['kitted_plans'] / stats['total_plans'] if stats['total_plans'] else 0
-        msg += f"总体齐套率: {total_rate:.1%}\n\n"
-        msg += "--- 各车间详情 ---\n"
-        
-        for ws, d in stats['ws_stats'].items():
-            r = d['kitted'] / d['total'] if d['total'] else 0
-            msg += f"{ws}: {r:.1%} ({d['kitted']}/{d['total']})\n"
-            
-        messagebox.showinfo("分析结果", msg)
+                GROUP_KEY = ['产品编号', '料号']
 
-if __name__ == "__main__":
-    try:
-        root = tk.Tk()
-        app = DailyPlanAvailabilityApp(root)
-        root.mainloop()
-    except Exception as e:
-        # 如果报错，提供一个简单的弹窗
-        import tkinter.messagebox
-        tkinter.messagebox.showerror("启动失败", str(e))
+                # *********** 修改点 2 ***********
+                # 从 df_final 读取数据
+                df_agg = df_final.groupby(GROUP_KEY, sort=False)['标准工时'].agg(
+                    总工时='sum',
+                    瓶颈工时='max'
+                )
+                print(" - 已计算总工时与瓶颈工时")
+
+                # *********** 修改点 3 ***********
+                # 从 df_final 读取数据
+                idx_bottleneck = df_final.groupby(GROUP_KEY, sort=False)['标准工时'].idxmax()
+                print(" - 已定位瓶颈工序索引")
+
+                # *********** 修改点 4 ***********
+                # 从 df_final 读取数据
+                df_base_info = df_final.drop_duplicates(subset=GROUP_KEY, keep='first').copy()
+                print(" - 已提取物料基本信息 (按首次出现顺序)")
+
+                # *********** 修改点 5 ***********
+                # 从 df_final 读取数据
+                bottleneck_cols = GROUP_KEY + ['工序序号', '工艺名称', '设备编号', '车间']
+                df_bottleneck_details = df_final.loc[idx_bottleneck.values, bottleneck_cols].copy()
+
+                # 5. 重命名 (保持不变)
+                rename_map_p5 = {
+                    '工序序号': '瓶颈工序序号',
+                    '工艺名称': '瓶颈工序',
+                    '设备编号': '瓶颈工序设备',
+                    '车间': '瓶颈工序车间'
+                }
+                df_bottleneck_details.rename(columns=rename_map_p5, inplace=True)
+                print(" - 已提取并重命名瓶颈工序详情")
+
+                # 6. 合并所有信息 (保持不变)
+                df_summary = df_base_info.set_index(GROUP_KEY)
+                df_summary = df_summary.join(df_agg)
+                df_summary = df_summary.reset_index().merge(df_bottleneck_details, on=GROUP_KEY, how='left')
+                print(" - 已合并基础信息、聚合工时、瓶颈详情")
+
+                # 7. 定义并选择最终的列顺序 (保持不变)
+                final_columns_order = [
+                    '产品编号', '产品名称', '工单单号', '工单单别',
+                    '料号', '品名', '物料描述', 'BOM阶次', '组成用量',
+                    '总工时',
+                    '瓶颈工时',
+                    '瓶颈工序序号',
+                    '瓶颈工序',
+                    '瓶颈工序设备',
+                    '瓶颈工序车间',
+                    '父项MB025', '元件MB025'
+                ]
+                actual_final_cols = [col for col in final_columns_order if col in df_summary.columns]
+                df_summary = df_summary[actual_final_cols]
+
+            agg_end_time_p5 = time.time()
+            print(f"【内存中】数据聚合完成 (Part 5)。耗时: {agg_end_time_p5 - agg_start_time_p5:.2f} 秒。")
+            # --- Part 5 聚合结束 ---
+
+            # --- 在写入Excel前，移除辅助列 '父项MB025', '元件MB025' ---
+            columns_to_drop_from_final_output = []
+            if '父项MB025' in df_summary.columns:  # <-- 修改点: 检查 df_summary
+                columns_to_drop_from_final_output.append('父项MB025')
+            if '元件MB025' in df_summary.columns:  # <-- 修改点: 检查 df_summary
+                columns_to_drop_from_final_output.append('元件MB025')
+
+            if columns_to_drop_from_final_output:
+                df_summary.drop(columns=columns_to_drop_from_final_output, inplace=True)  # <-- 修改点: 从 df_summary 移除
+                print(f"\n - 已从最终输出DataFrame中移除辅助列: {columns_to_drop_from_final_output}")
+
+            if not df_summary.empty:  # <-- 修改点: 检查 df_summary
+                # --- 使用文件对话框选择输出路径和文件名 ---
+                root = tk.Tk()
+                root.withdraw()
+
+                # *** 修改点 3: 更改默认文件名 ***
+                default_filename = "工艺资料表(计划排产模板-瓶颈工序).xlsx"  # <-- 修改点: 更改默认文件名
+
+                output_filepath = filedialog.asksaveasfilename(
+                    defaultextension=".xlsx",
+                    filetypes=[("Excel 文件", "*.xlsx"), ("所有文件", "*.*")],
+                    initialfile=default_filename,
+                    title="选择保存位置和文件名 (物料汇总视图)"
+                )
+                if output_filepath:
+                    output_directory = os.path.dirname(output_filepath)
+                    if output_directory and not os.path.exists(output_directory):
+                        try:
+                            os.makedirs(output_directory)
+                            print(f" - 目录 '{output_directory}' 不存在，已创建。")
+                        except OSError as e:
+                            print(f" - 错误: 创建目录 '{output_directory}' 失败: {e}")
+                            raise
+                    elif not output_directory:
+                        print(f" - 将文件保存在当前工作目录。")
+                    print(f"\n准备将最终结果【写入】到本地 Excel 文件: {output_filepath} ...")
+
+                    # *** 修改点 4: 保存 df_summary ***
+                    df_summary.to_excel(output_filepath, index=False, engine='openpyxl')  # <-- 修改点: 保存 df_summary
+
+                    print(f"\n【成功】最终结果已保存到文件: {output_filepath}")
+                    print("\n最终文件表头:")
+
+                    # *** 修改点 5: 打印 df_summary 的表头 ***
+                    print(df_summary.columns.tolist())  # <-- 修改点: 打印 df_summary 的表头
+                else:
+                    print("\n用户取消了文件保存操作，未生成 Excel 文件。")
+            else:
+                print("\n【内存中】经过聚合后，没有符合条件的记录，无法生成 Excel 文件。")  # <-- 修改点: 更新提示信息
+        else:
+            print("\n【内存中】初步筛选后没有符合条件的记录，无法进行后续调整。")
+    else:
+        print("\n【数据库读取】未查询到任何顶层成品或其 BOM 数据。")
+
+# --- 错误处理和数据库连接关闭 (保持不变) ---
+except pyodbc.Error as db_err:
+    sqlstate = db_err.args[0]
+    message = str(db_err.args[1])
+    print(f"\n【数据库错误】 SQLSTATE: {sqlstate}\n消息: {message}")
+    traceback.print_exc()
+except pd.errors.EmptyDataError:
+    print("\n【错误】读取数据库后得到空结果，无法处理。")
+    traceback.print_exc()
+except KeyError as key_err:
+    print(f"\n【程序错误】处理数据时发生列名错误: {key_err}。请检查列名是否存在。")
+    if 'df_filtered' in locals():
+        print("df_filtered 当前列名:", df_filtered.columns.tolist())
+    if 'df_intermediate' in locals():
+        print("df_intermediate 当前列名:", df_intermediate.columns.tolist())
+    traceback.print_exc()
+except PermissionError as perm_err:
+    print(f"\n【文件写入错误】无法保存 Excel 文件: {perm_err}。请检查文件是否被占用或文件夹权限。")
+    traceback.print_exc()
+except Exception as e:
+    print(f"\n【未知错误】执行过程中发生错误: {e}")
+    traceback.print_exc()
+finally:
+    if conn:
+        try:
+            conn.close()
+            print("\n数据库连接已【安全】关闭。")
+        except Exception as close_err:
+            print(f"关闭数据库连接时出错: {close_err}")
