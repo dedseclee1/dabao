@@ -48,7 +48,7 @@ COL_NAME_WO_NO = "工单单号"
 class DailyPlanAvailabilityApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"排程齐套分析 (最终逻辑重构版) - {CURRENT_DRIVER}")
+        self.root.title(f"排程齐套分析 (含当日齐套判定) - {CURRENT_DRIVER}")
         self.root.geometry("1000x650")
 
         self.file_path = tk.StringVar()
@@ -96,8 +96,8 @@ class DailyPlanAvailabilityApp:
         action_frame = ttk.LabelFrame(main_frame, text="3. 执行", padding="10")
         action_frame.pack(fill=tk.X, pady=10)
         
-        btn_text = "备份 -> 模拟推演 -> 写入A列 (含前缀描述)"
-        ttk.Button(action_frame, text=btn_text, command=self._run_analysis_logic_v2).pack(fill=tk.X, padx=100)
+        btn_text = "备份 -> 模拟推演 -> 写入A列 (含当日状态)"
+        ttk.Button(action_frame, text=btn_text, command=self._run_analysis_logic_v3).pack(fill=tk.X, padx=100)
 
         self.log_text = tk.Text(main_frame, height=15, state="disabled", font=("Consolas", 9), bg="#F0F0F0")
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -196,13 +196,7 @@ class DailyPlanAvailabilityApp:
             messagebox.showerror("备份失败", f"无法创建备份文件，操作已取消。\n{e}")
             return False
 
-    def _run_analysis_logic_v2(self):
-        """
-        新的逻辑入口：
-        1. 提取工单，并确定工单在范围内的'开工日期'用于排序。
-        2. 按照排序后的顺序，依次扣减库存。
-        3. 回写A列。
-        """
+    def _run_analysis_logic_v3(self):
         start_date = self.date_start.get_date()
         end_date = self.date_end.get_date()
         
@@ -230,9 +224,9 @@ class DailyPlanAvailabilityApp:
         
         sorted_target_cols = sorted(target_cols_map.keys())
 
-        msg = (f"即将执行逻辑重构版分析：\n\n文件: {file_path}\n"
+        msg = (f"即将执行排程分析：\n\n文件: {file_path}\n"
                f"日期: {start_date} 至 {end_date}\n\n"
-               "逻辑：按工单开工日期顺序扣减库存 -> 回写A列\n"
+               "逻辑更新：\n1. 模拟工单总需求扣减库存\n2. 额外判断当日排产计划是否齐套\n\n"
                "是否继续？")
         
         confirm = messagebox.askyesno("确认修改", msg)
@@ -245,15 +239,15 @@ class DailyPlanAvailabilityApp:
             wb = openpyxl.load_workbook(file_path)
             ws = wb[sheet_name]
 
-            self._log(f"提取工单并确定开工顺序...")
-            # 提取数据：列表包含 {'wo_key':..., 'start_date':..., 'row_idx':...}
-            wo_list = self._extract_data_with_start_date(ws, sorted_target_cols, target_cols_map, target_workshop)
+            self._log(f"提取工单、计划数量并确定开工顺序...")
+            # 提取数据包含：wo_key, start_date, row_idx, AND plan_qty
+            wo_list = self._extract_data_with_details(ws, sorted_target_cols, target_cols_map, target_workshop)
             
             if not wo_list:
                 messagebox.showinfo("无数据", "所选范围内没有排产数量 > 0 的工单。")
                 return
 
-            # 按开工日期排序，如果日期相同，按行号排序（Excel从上到下）
+            # 按开工日期排序，如果日期相同，按行号排序
             wo_list.sort(key=lambda x: (x['start_date'], x['row_idx']))
             
             self._log(f"查询ERP数据 (共 {len(wo_list)} 张工单)...")
@@ -270,12 +264,8 @@ class DailyPlanAvailabilityApp:
             # 模拟环境
             running_inv = copy.deepcopy(static_inventory)
             
-            # 这里的 running_wo_issued 我们其实不需要模拟扣减它，
-            # 因为新逻辑是：需求 = (BOM总 - 已领)。这个“已领”是ERP里的静态值。
-            # 我们只需要扣减 running_inv 即可。
-
-            self._log("开始推演 (库存模拟扣减)...")
-            results = self._simulate_logic_v2(wo_list, static_wo_data, running_inv)
+            self._log("开始推演 (库存模拟扣减 & 当日判定)...")
+            results = self._simulate_logic_v3(wo_list, static_wo_data, running_inv)
 
             self._log("正在回写 A 列...")
             font_style = Font(name="微软雅黑", size=9)
@@ -283,18 +273,15 @@ class DailyPlanAvailabilityApp:
             count = 0
             for r in results:
                 row_idx = r['row_idx']
-                # 格式：齐套率：XX%，最小可生产数：XX，缺料信息：品号,品名,缺XX单位
+                # 格式：齐套率：XX%，当日：[齐套/缺料]，最小可生产数：XX，缺料信息：品号,品名,缺XX单位
+                
                 rate_str = f"{r['rate']:.0%}"
+                daily_status = r['daily_status']
                 
-                # 缺料信息处理
                 msg = r['msg']
-                # 如果 msg 是空的（完全齐套），不需要加前面的冒号
-                # 但根据需求，要写“缺料信息：xxx”
-                # 如果没缺料，就写“缺料信息：”或留白？通常留空比较好看
-                
                 detail_str = f"缺料信息：{msg}" if msg else "缺料信息："
                 
-                final_str = f"齐套率：{rate_str}，最小可生产数：{r['achievable']}，{detail_str}"
+                final_str = f"齐套率：{rate_str}，当日：{daily_status}，最小可生产数：{r['achievable']}，{detail_str}"
                 
                 cell = ws.cell(row=row_idx, column=1)
                 cell.value = final_str
@@ -313,9 +300,11 @@ class DailyPlanAvailabilityApp:
             self._log(f"错误: {e}")
             messagebox.showerror("运行错误", f"发生错误，文件未保存。\n{e}")
 
-    def _extract_data_with_start_date(self, ws, sorted_col_indices, col_date_map, filter_ws):
+    def _extract_data_with_details(self, ws, sorted_col_indices, col_date_map, filter_ws):
         """
-        遍历行，找到每行在选定范围内的'最早有数日期'
+        遍历行，找到：
+        1. 开工日期 (start_date)
+        2. 选定范围内的排产总数 (plan_qty) - 用于当日齐套判定
         """
         c_ws = self.col_map_main.get(COL_NAME_WORKSHOP)
         c_type = self.col_map_main.get(COL_NAME_WO_TYPE)
@@ -329,21 +318,18 @@ class DailyPlanAvailabilityApp:
             try:
                 found_start = False
                 first_date = None
+                range_total_qty = 0
                 
-                # 检查此行在范围内是否有排产
-                has_qty = False
                 for col_idx in sorted_col_indices:
                     if col_idx <= len(row):
                         val = row[col_idx - 1].value
                         if isinstance(val, (int, float)) and val > 0:
-                            has_qty = True
+                            range_total_qty += val
                             if not found_start:
                                 found_start = True
                                 first_date = col_date_map[col_idx]
-                            # 找到第一个日期后，其实可以不用遍历完，但为了确认是否有数，还是遍历吧
-                            # 优化：一旦找到 first_date，其实后面只需通过 has_qty 确认即可
                 
-                if has_qty:
+                if range_total_qty > 0:
                     val_ws = row[c_ws - 1].value if (c_ws and c_ws <= len(row)) else None
                     curr_ws = str(val_ws).strip() if val_ws else "未分类"
                     
@@ -356,6 +342,7 @@ class DailyPlanAvailabilityApp:
                         data.append({
                             'wo_key': (str(wt).strip(), str(wn).strip()),
                             'start_date': first_date, # 用于排序
+                            'plan_qty': int(round(range_total_qty)), # 用于当日齐套判定
                             'row_idx': row[0].row
                         })
             except:
@@ -369,7 +356,6 @@ class DailyPlanAvailabilityApp:
         batch_size = 200
         for i in range(0, len(conditions), batch_size):
             batch = conditions[i:i + batch_size]
-            # 增加查询 TA.TA011 (工单状态)
             sql = f"""
                 SELECT RTRIM(TA.TA001) t, RTRIM(TA.TA002) n, TA.TA015 total, TA.TA011 status,
                        RTRIM(TB.TB003) p, ISNULL(RTRIM(MB.MB002),'') name, 
@@ -410,37 +396,38 @@ class DailyPlanAvailabilityApp:
                 pass
         return inv
 
-    def _simulate_logic_v2(self, wo_list, wo_data, running_inv):
+    def _simulate_logic_v3(self, wo_list, wo_data, running_inv):
         results = []
 
         for item in wo_list:
             key = item['wo_key']
             row_idx = item['row_idx']
+            plan_qty = item['plan_qty'] # 当日/当期计划数
+            
             info = wo_data.get(key)
             
             res = {
                 'row_idx': row_idx,
-                'rate': 0.0, 'achievable': 0, 'msg': ""
+                'rate': 0.0, 'achievable': 0, 'daily_status': "未知", 'msg': ""
             }
 
             if not info or not info['bom']:
                 res['msg'] = "无ERP信息"
+                res['daily_status'] = "异常"
                 results.append(res)
                 continue
 
-            # 优先级 1: 工单已完工 (ERP状态为 Y 或 y)
+            # 优先级 1: 工单已完工
             if info['status'].upper() == 'Y':
                 res['rate'] = 1.0
-                res['achievable'] = int(info['total']) # 既然完工了，可产数量就是总量
+                res['achievable'] = int(info['total'])
+                res['daily_status'] = "齐套" # 完工了当然齐套
                 res['msg'] = "工单已完工"
                 results.append(res)
                 continue
 
-            # 开始计算 BOM 缺口
-            # 需求基准：工单剩余需领量 (Total_Req - Issued)
-            # 注意：这里不需要乘以工单数量，因为 TB004 (需领用量) 已经是该工单的总需领用量了
-            
-            wo_remaining_needs = {} # {part: amount}
+            # 准备计算
+            wo_remaining_needs = {} # 工单总缺口
             total_remaining_demand = 0
             
             for b in info['bom']:
@@ -449,78 +436,80 @@ class DailyPlanAvailabilityApp:
                     wo_remaining_needs[b['part']] = rem
                     total_remaining_demand += rem
 
-            # 优先级 2: 发料齐套 (无需领料)
+            # 优先级 2: 发料齐套 (工单总需求已满足)
             if total_remaining_demand == 0:
                 res['rate'] = 1.0
                 res['achievable'] = int(info['total'])
+                res['daily_status'] = "齐套"
                 res['msg'] = "发料齐套"
                 results.append(res)
                 continue
 
-            # 优先级 3 & 4: 仓库齐套 或 缺料
-            # 遍历 BOM 计算缺料详情，并扣减库存
+            # 优先级 3 & 4: 仓库齐套 / 缺料
             
             min_rate = 1.0
-            # 最小可生产数计算：
-            # 逻辑：对于每一个料，可支持套数 = (已领 + 仓库库存) // 单耗
-            # 这里的单耗 = b['req'] / info['total']
             min_possible_sets = 999999
-            
             short_details = []
-            is_warehouse_short = False # 是否真缺料
+            is_warehouse_short = False 
+            is_daily_short = False # 当日是否缺料
 
             for b in info['bom']:
                 # 单耗
                 unit_use = b['req'] / info['total'] if info['total'] > 0 else 0
                 if unit_use <= 0: continue
                 
-                # 该料剩余需求
-                part_need = wo_remaining_needs.get(b['part'], 0)
-                
-                # 当前库存
+                # --- A. 宏观分析 (针对工单总缺口) ---
+                part_need_total = wo_remaining_needs.get(b['part'], 0)
                 stock = running_inv.get(b['part'], 0)
                 effective_stock = max(0, stock)
-                
-                # 计算齐套率 (针对剩余需求)
-                if part_need > 0:
-                    part_rate = effective_stock / part_need
+
+                if part_need_total > 0:
+                    part_rate = effective_stock / part_need_total
                     if part_rate > 1.0: part_rate = 1.0
                     if part_rate < min_rate: min_rate = part_rate
                     
-                    if effective_stock < part_need - 0.0001:
+                    # 宏观缺料判定
+                    if effective_stock < part_need_total - 0.0001:
                         is_warehouse_short = True
-                        diff = part_need - effective_stock
-                        # 格式：品号,品名,缺数量单位
+                        diff = part_need_total - effective_stock
                         short_details.append(f"{b['part']},{b['name']},缺{diff:g}{b['unit']}")
 
-                # 计算可产数量 (基于总需求 perspective)
-                # 可用总数 = 已领 (b['iss']) + 仓库 (effective_stock)
+                # 最小可产数 (宏观)
                 total_avail_material = b['iss'] + effective_stock
                 can_do_sets = int(total_avail_material // unit_use)
                 min_possible_sets = min(min_possible_sets, can_do_sets)
 
-                # --- 关键：扣减库存 ---
-                # 无论是否缺料，都要把该工单的需求扣掉，因为按日期排在前面的工单有优先权
-                if part_need > 0:
+                # --- B. 微观分析 (针对当日计划) ---
+                # 当日需求 = 计划数 * 单耗
+                daily_part_need = plan_qty * unit_use
+                # 如果当前库存 < 当日需求，且工单本身也没领够(part_need_total>0)
+                # 注意：如果工单本身只缺1个，但当日计划算出来要10个(理论上不会，因为已领的也会算进去)，
+                # 严谨逻辑：当日还需要去仓库领的数量 = max(0, daily_part_need - (已领 - 该料其他工单已耗? 复杂))
+                # 简化逻辑：我们已经知道该工单还需要领 part_need_total。
+                # 那么当日为了完成 plan_qty，需要保证库存里至少有 min(part_need_total, daily_part_need)
+                # 解释：如果只需领5个就结单了，但排产排了100个(需求100)，那其实只需仓库有5个就能把这单做完，当日也就算齐套了。
+                
+                actual_daily_draw_need = min(part_need_total, daily_part_need)
+                
+                if effective_stock < actual_daily_draw_need - 0.0001:
+                    is_daily_short = True
+
+                # --- C. 库存扣减 (按工单总缺口锁定) ---
+                if part_need_total > 0:
                     if b['part'] not in running_inv: running_inv[b['part']] = 0.0
-                    running_inv[b['part']] -= part_need
-                    # 库存允许扣成负数吗？
-                    # 逻辑上，库存被扣完就是0，后续工单看到的就是0。
-                    # 如果扣成负数，方便追踪缺口，但后续工单判断 effective_stock = max(0, stock) 即可。
-                    # 所以直接减是可以的。
+                    running_inv[b['part']] -= part_need_total
 
             # 汇总结果
             res['achievable'] = min(int(info['total']), min_possible_sets)
             res['rate'] = min_rate
+            res['daily_status'] = "缺料" if is_daily_short else "齐套"
 
             if not is_warehouse_short:
-                # 优先级 3: 仓库齐套
                 res['msg'] = "仓库齐套"
-                res['rate'] = 1.0 # 既然仓库够，就是100%
+                res['rate'] = 1.0
                 res['achievable'] = int(info['total'])
             else:
-                # 优先级 4: 缺料
-                res['msg'] = "; ".join(short_details) # 分号分隔不同物料
+                res['msg'] = "; ".join(short_details)
 
             results.append(res)
 
