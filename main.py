@@ -7,8 +7,10 @@ import pyodbc
 import traceback
 import datetime
 import copy
+import shutil  # 用于文件复制
+import os      # 用于路径处理
 from collections import defaultdict
-from openpyxl.styles import Font, Alignment
+from openpyxl.styles import Font
 from tkcalendar import DateEntry
 
 # ============== 用户配置区 ==============
@@ -46,7 +48,7 @@ COL_NAME_WO_NO = "工单单号"
 class DailyPlanAvailabilityApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"多日排程汇总齐套分析 (回写A列版) - {CURRENT_DRIVER}")
+        self.root.title(f"排程齐套分析 (Openpyxl最终版+单位) - {CURRENT_DRIVER}")
         self.root.geometry("1000x650")
 
         self.file_path = tk.StringVar()
@@ -62,7 +64,7 @@ class DailyPlanAvailabilityApp:
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # 1. 文件选择
-        file_frame = ttk.LabelFrame(main_frame, text="1. 数据源 (直接修改源文件)", padding="5")
+        file_frame = ttk.LabelFrame(main_frame, text="1. 数据源 (程序将自动备份原文件)", padding="5")
         file_frame.pack(fill=tk.X, pady=5)
         ttk.Entry(file_frame, textvariable=self.file_path, width=50).pack(side=tk.LEFT, padx=5)
         ttk.Button(file_frame, text="浏览Excel...", command=self._select_file).pack(side=tk.LEFT, padx=5)
@@ -94,7 +96,7 @@ class DailyPlanAvailabilityApp:
         action_frame = ttk.LabelFrame(main_frame, text="3. 执行", padding="10")
         action_frame.pack(fill=tk.X, pady=10)
         
-        btn_text = "计算所选日期范围的总齐套率 -> 写入A列"
+        btn_text = "备份 -> 计算汇总齐套率 -> 写入A列 (含单位)"
         ttk.Button(action_frame, text=btn_text, command=self._run_analysis_aggregated).pack(fill=tk.X, padx=100)
 
         self.log_text = tk.Text(main_frame, height=15, state="disabled", font=("Consolas", 9), bg="#F0F0F0")
@@ -131,7 +133,6 @@ class DailyPlanAvailabilityApp:
             ws = wb[sheet_name]
 
             self.col_map_main = {}
-            # 扫描表头 (Row 3 优先，然后 Row 2)
             scan_rows = [3, 2]
             for r in scan_rows:
                 for idx, cell in enumerate(ws[r], start=1):
@@ -139,14 +140,12 @@ class DailyPlanAvailabilityApp:
                     if val and val not in self.col_map_main:
                         self.col_map_main[val] = idx
 
-            # 日期列扫描 (只扫描第3行)
             self.date_column_map = {}
             for cell in ws[3]:
                 val = cell.value
                 dt = self._parse_excel_date(val)
                 if dt: self.date_column_map[dt] = cell.column
 
-            # 车间扫描
             col_ws_idx = self.col_map_main.get(COL_NAME_WORKSHOP)
             workshops = set()
             if col_ws_idx:
@@ -179,6 +178,25 @@ class DailyPlanAvailabilityApp:
         except:
             return None
 
+    def _create_backup(self, file_path):
+        """创建文件备份"""
+        try:
+            dir_name = os.path.dirname(file_path)
+            base_name = os.path.basename(file_path)
+            name_part, ext_part = os.path.splitext(base_name)
+            
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_name = f"{name_part}_备份_{timestamp}{ext_part}"
+            backup_path = os.path.join(dir_name, backup_name)
+            
+            shutil.copy2(file_path, backup_path)
+            self._log(f"已创建备份文件: {backup_name}")
+            return True
+        except Exception as e:
+            self._log(f"备份失败: {e}")
+            messagebox.showerror("备份失败", f"无法创建备份文件，操作已取消。\n{e}")
+            return False
+
     def _run_analysis_aggregated(self):
         start_date = self.date_start.get_date()
         end_date = self.date_end.get_date()
@@ -205,17 +223,25 @@ class DailyPlanAvailabilityApp:
             messagebox.showwarning("日期无效", "所选日期范围内没有在Excel第3行找到对应的日期列。")
             return
 
-        confirm = messagebox.askyesno("确认修改", f"即将分析以下范围并回写A列：\n\n文件: {file_path}\n日期: {start_date} 至 {end_date}\n(共 {len(target_cols)} 个排产日)\n\n操作模式：汇总多日数量 -> 计算总齐套率 -> 覆盖A列\n是否继续？")
+        msg = (f"即将分析并修改文件：\n\n文件: {file_path}\n"
+               f"日期: {start_date} 至 {end_date}\n\n"
+               "程序将自动创建一份备份文件，然后修改原文件的A列。\n"
+               "是否继续？")
+        
+        confirm = messagebox.askyesno("确认修改", msg)
         if not confirm: return
 
+        # --- 执行备份 ---
+        self._log("正在创建备份...")
+        if not self._create_backup(file_path):
+            return
+
         try:
-            self._log(f"正在加载源文件...")
-            # 必须用非 read_only 模式才能保存
+            self._log(f"正在加载源文件 (Openpyxl)...")
             wb = openpyxl.load_workbook(file_path)
             ws = wb[sheet_name]
 
             self._log(f"正在汇总排产数据 (包含 {len(target_cols)} 天)...")
-            # 提取并汇总数据
             plans = self._extract_data_aggregated(ws, target_cols, target_workshop)
             
             if not plans:
@@ -233,7 +259,6 @@ class DailyPlanAvailabilityApp:
             
             static_inventory = self._fetch_inventory(list(all_parts))
 
-            # 准备推演环境
             running_inv = copy.deepcopy(static_inventory)
             running_wo_issued = defaultdict(float)
             for k, v in static_wo_data.items():
@@ -249,13 +274,8 @@ class DailyPlanAvailabilityApp:
             count = 0
             for r in results:
                 row_idx = r['row_idx']
-                
-                # 齐套率：可产数量：工单净需求：缺料信息
                 rate_str = f"{r['rate']:.0%}"
-                
-                # 处理换行符，避免 Excel 显示过乱
                 msg = r['msg'].replace("\n", "; ")
-                
                 final_str = f"{rate_str}：{r['achievable']}：{r['net_demand']}：{msg}"
                 
                 cell = ws.cell(row=row_idx, column=1)
@@ -267,7 +287,7 @@ class DailyPlanAvailabilityApp:
             wb.save(file_path)
             wb.close()
             
-            messagebox.showinfo("完成", f"已分析 {start_date} 到 {end_date} 的排产。\n结果已写入 {count} 行到 A 列。")
+            messagebox.showinfo("完成", f"分析完成！\n已备份原文件。\n结果已写入 {count} 行到 A 列。")
             self._log("全部完成。")
 
         except Exception as e:
@@ -276,9 +296,6 @@ class DailyPlanAvailabilityApp:
             messagebox.showerror("运行错误", f"发生错误，文件未保存。\n{e}")
 
     def _extract_data_aggregated(self, ws, col_indices, filter_ws):
-        """
-        遍历行，将 col_indices 列表中的所有列的值相加，作为 qty
-        """
         c_ws = self.col_map_main.get(COL_NAME_WORKSHOP)
         c_type = self.col_map_main.get(COL_NAME_WO_TYPE)
         c_no = self.col_map_main.get(COL_NAME_WO_NO)
@@ -289,16 +306,13 @@ class DailyPlanAvailabilityApp:
         data = []
         for row in ws.iter_rows(min_row=ROW_IDX_DATA_START):
             try:
-                # 汇总这一行在选定日期的所有数量
                 total_qty = 0
                 for col_idx in col_indices:
-                    # col_idx 是 1-based，row是0-based tuple
                     if col_idx <= len(row):
                         val = row[col_idx - 1].value
                         if isinstance(val, (int, float)) and val > 0:
                             total_qty += val
                 
-                # 如果总数 > 0，则纳入分析
                 if total_qty > 0:
                     int_qty = int(round(total_qty))
                     
@@ -313,8 +327,8 @@ class DailyPlanAvailabilityApp:
                     if wt and wn:
                         data.append({
                             'wo_key': (str(wt).strip(), str(wn).strip()),
-                            'qty': int_qty, # 这是多天的总和
-                            'row_idx': row[0].row # 记录行号用于回写
+                            'qty': int_qty, 
+                            'row_idx': row[0].row
                         })
             except:
                 continue
@@ -367,8 +381,6 @@ class DailyPlanAvailabilityApp:
 
     def _simulate_logic(self, plans, wo_data, running_inv, running_wo_issued):
         results = []
-
-        # plans 里的 qty 已经是多天汇总的总数了
         for p in plans:
             key = p['wo_key']
             plan_qty = p['qty']
@@ -386,7 +398,6 @@ class DailyPlanAvailabilityApp:
                 results.append(res)
                 continue
 
-            # 1. 确定ERP上限（工单剩余未生产量）
             max_possible_by_erp_limit = 999999
             for b in info['bom']:
                 unit_use = b['req'] / info['total'] if info['total'] > 0 else 0
@@ -397,7 +408,6 @@ class DailyPlanAvailabilityApp:
                 if possible_sets < max_possible_by_erp_limit:
                     max_possible_by_erp_limit = possible_sets
 
-            # 净需求取：排程总数 和 ERP工单剩余数 的较小值
             final_net_demand_int = min(plan_qty, max_possible_by_erp_limit)
             
             min_material_rate = 1.0
@@ -405,7 +415,6 @@ class DailyPlanAvailabilityApp:
             short_details = []
             to_deduct_full = {}
 
-            # 2. 遍历BOM计算齐套
             for b in info['bom']:
                 unit_use = b['req'] / info['total'] if info['total'] > 0 else 0
                 if unit_use <= 0: continue
@@ -425,10 +434,9 @@ class DailyPlanAvailabilityApp:
 
                 if stock < part_net_demand - 0.0001:
                     diff = part_net_demand - stock
-                    short_details.append(f"{b['name']}缺{diff:g}")
+                    # ============== 修改点：增加了 b['unit'] ==============
+                    short_details.append(f"{b['name']}缺{diff:g}{b['unit']}")
 
-                # 无论是否齐套，为了后续行的准确性，这里假设按计划扣减
-                # (或者根据您的业务逻辑，如果完全缺料可能就不扣了，但通常排程检查是假设要生产的)
                 full_demand = plan_qty * unit_use 
                 to_deduct_full[b['part']] = full_demand
 
@@ -447,7 +455,6 @@ class DailyPlanAvailabilityApp:
 
             results.append(res)
 
-            # 扣减库存 (影响下一行工单的计算)
             for part, qty in to_deduct_full.items():
                 if part not in running_inv: running_inv[part] = 0.0
                 running_inv[part] -= qty
