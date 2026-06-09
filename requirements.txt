@@ -1,4 +1,6 @@
 pandas
-openpyxl
-pyodbc
+numpy
+SQLAlchemy
+PyMySQL
 tkcalendar
+XlsxWriter
